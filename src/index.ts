@@ -1,136 +1,75 @@
-import 'dotenv/config';
-import { readJsonFile, writeJsonFile, appendJsonFile } from './persistence.js';
-import { scanForLiquidations, filterByProfitability, filterByRisk, sortByProfit } from './scanner.js';
-import { analyzeLiquidationOpportunity } from './analyzer.js';
-import { assessRisk } from './math.js';
-import type { LiquidationOpportunity, ExecutionResult, LiquidationMetrics } from './types.js';
+import { emitEvent } from './mm-contract.js';
+import { ClaudeGate } from './claude-gate.js';
+import { assertRunnable, ConfigError, loadConfig, STRATEGY_NAME } from './config.js';
+import { runCycle } from './cycle.js';
+import { createSource } from './sources/index.js';
+import { createTelegramNotifier } from './telegram.js';
 
-const dryRun = process.env.DRY_RUN === 'true';
-const autoExecute = process.env.AUTO_EXECUTE === 'true' && !dryRun;
-const minProfitUSD = Number(process.env.MIN_LIQUIDATION_PROFIT_USD ?? '100');
-const maxSizeUSD = Number(process.env.MAX_LIQUIDATION_SIZE_USD ?? '5000');
-const ledgerPath = process.env.LEDGER_PATH ?? '.state/liquidation-ledger.json';
-const metricsPath = process.env.METRICS_PATH ?? '.state/liquidation-metrics.json';
-
-async function main() {
-  console.log(`\n🚀 Liquidation Hunter | mode=${dryRun ? 'DRY_RUN' : autoExecute ? 'AUTO' : 'MANUAL'}\n`);
-
-  const opportunities = await scanForLiquidations();
-  console.log(`📊 Scanned ${opportunities.length} opportunities\n`);
-
-  // Filter and sort
-  const profitable = filterByProfitability(opportunities, minProfitUSD);
-  const lowRisk = filterByRisk(profitable, 80);
-  const sorted = sortByProfit(lowRisk);
-
-  console.log(`💰 Profitable (>${minProfitUSD}): ${profitable.length}`);
-  console.log(`✅ Low risk (<80): ${lowRisk.length}`);
-  console.log(`📈 Sorted by profit: ${sorted.length}\n`);
-
-  const executions: ExecutionResult[] = [];
-
-  for (const opp of sorted.slice(0, 5)) {
-    console.log(`Processing: ${opp.id}`);
-    console.log(`  Profit: $${opp.expectedProfit.toFixed(2)} | Risk: ${opp.riskScore.toFixed(0)}/100`);
-
-    // Risk assessment
-    const risk = assessRisk(opp.ltv, opp.liquidationThreshold, opp.expectedProfit, 50, minProfitUSD);
-    console.log(`  Risk assessment: ${risk.reason}`);
-
-    if (!risk.approved) {
-      console.log(`  ❌ SKIPPED\n`);
-      executions.push({
-        id: `exec-${Date.now()}`,
-        opportunityId: opp.id,
-        executed: false,
-        profitUSD: 0,
-        error: risk.reason,
-        timestamp: new Date().toISOString(),
-      });
-      continue;
-    }
-
-    // Claude analysis
-    const analysis = await analyzeLiquidationOpportunity(opp, process.env.ANTHROPIC_API_KEY ?? '');
-    console.log(`  Claude: ${analysis.reasoning}`);
-
-    if (analysis.decision !== 'execute') {
-      console.log(`  ❌ SKIPPED\n`);
-      executions.push({
-        id: `exec-${Date.now()}`,
-        opportunityId: opp.id,
-        executed: false,
-        profitUSD: 0,
-        error: analysis.reasoning,
-        timestamp: new Date().toISOString(),
-      });
-      continue;
-    }
-
-    if (dryRun) {
-      console.log(`  ✅ DRY_RUN: Would execute | profit=$${opp.expectedProfit.toFixed(2)}\n`);
-      executions.push({
-        id: `exec-${Date.now()}`,
-        opportunityId: opp.id,
-        executed: true,
-        profitUSD: opp.expectedProfit,
-        timestamp: new Date().toISOString(),
-      });
-      continue;
-    }
-
-    if (autoExecute) {
-      console.log(`  ⚡ EXECUTING...`);
-      // In production: actual liquidation call
-      executions.push({
-        id: `exec-${Date.now()}`,
-        opportunityId: opp.id,
-        executed: true,
-        profitUSD: opp.expectedProfit,
-        transactionHash: '0x' + 'a'.repeat(64),
-        timestamp: new Date().toISOString(),
-      });
-      console.log(`  ✅ EXECUTED | profit=$${opp.expectedProfit.toFixed(2)}\n`);
-      continue;
-    }
-
-    console.log(`  ⏳ MANUAL APPROVAL REQUIRED\n`);
+function loadDotEnv(): void {
+  try {
+    process.loadEnvFile('.env');
+  } catch {
+    // no .env file: rely on the process environment
   }
-
-  // Save results
-  for (const exec of executions) {
-    await appendJsonFile(ledgerPath, exec);
-  }
-
-  // Calculate metrics
-  const allExecutions = await readJsonFile<ExecutionResult[]>(ledgerPath, []);
-  const metrics: LiquidationMetrics = {
-    totalScanned: opportunities.length,
-    totalOpportunities: profitable.length,
-    successfulLiquidations: allExecutions.filter((e) => e.executed).length,
-    failedAttempts: allExecutions.filter((e) => !e.executed).length,
-    totalProfitUSD: allExecutions.reduce((sum, e) => sum + (e.executed ? e.profitUSD : 0), 0),
-    averageProfitPerTrade:
-      allExecutions.filter((e) => e.executed).length > 0
-        ? allExecutions.filter((e) => e.executed).reduce((sum, e) => sum + e.profitUSD, 0) /
-          allExecutions.filter((e) => e.executed).length
-        : 0,
-    winRate: allExecutions.length > 0 ? allExecutions.filter((e) => e.executed).length / allExecutions.length : 0,
-    lastUpdated: new Date().toISOString(),
-  };
-
-  await writeJsonFile(metricsPath, metrics);
-
-  console.log('\n📊 Metrics Summary:');
-  console.log(`  Total scanned: ${metrics.totalScanned}`);
-  console.log(`  Successful liquidations: ${metrics.successfulLiquidations}`);
-  console.log(`  Total profit: $${metrics.totalProfitUSD.toFixed(2)}`);
-  console.log(`  Win rate: ${(metrics.winRate * 100).toFixed(1)}%`);
-  console.log(`  Avg profit per trade: $${metrics.averageProfitPerTrade.toFixed(2)}\n`);
-
-  const interval = Number(process.env.LIQUIDATION_INTERVAL_MS ?? '60000');
-  console.log(`Next cycle in ${interval}ms...\n`);
-  setTimeout(main, interval);
 }
 
-await main();
+async function main(): Promise<number> {
+  loadDotEnv();
+  const once = process.argv.includes('--once');
+
+  let config;
+  try {
+    config = loadConfig();
+    assertRunnable(config);
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      console.error(`[${STRATEGY_NAME}] refusing to start: ${err.message}`);
+      await emitEvent({ source: STRATEGY_NAME, level: 'error', type: 'config.invalid', message: err.message });
+      return 1;
+    }
+    throw err;
+  }
+
+  const source = createSource(config);
+  const claudeGate = config.claudeGateEnabled && config.anthropicApiKey ? ClaudeGate.fromApiKey(config.anthropicApiKey) : undefined;
+  const notifier = createTelegramNotifier(config.telegramBotToken, config.telegramChatId);
+
+  console.log(
+    `[${STRATEGY_NAME}] mode=${config.mode} source=${source.id}${source.simulated ? ' (SIMULATED)' : ''} ` +
+      `claudeGate=${claudeGate ? 'on' : 'off'} telegram=${config.telegramBotToken && config.telegramChatId ? 'on' : 'off'}`,
+  );
+
+  if (once) {
+    await runCycle({ config, source, claudeGate, notifier });
+    return 0;
+  }
+
+  let stopping = false;
+  const stop = () => {
+    stopping = true;
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  while (!stopping) {
+    try {
+      await runCycle({ config, source, claudeGate, notifier });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[${STRATEGY_NAME}] cycle failed: ${msg}`);
+      await emitEvent({ source: STRATEGY_NAME, level: 'error', type: 'cycle.failed', message: msg });
+    }
+    const until = Date.now() + config.intervalMs;
+    while (!stopping && Date.now() < until) await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
+  }
+  return 0;
+}
+
+main().then(
+  (code) => {
+    process.exitCode = code;
+  },
+  (err) => {
+    console.error(`[${STRATEGY_NAME}] fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    process.exitCode = 1;
+  },
+);
